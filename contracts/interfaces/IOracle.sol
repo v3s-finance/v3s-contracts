@@ -8,4 +8,8 @@ interface IOracle {
     function consult(address _token, uint256 _amountIn) external view returns (uint144 amountOut);
 
     function twap(address _token, uint256 _amountIn) external view returns (uint144 _amountOut);
+
+    function getPegPrice() external view returns (int256);
+
+    function getPegPriceUpdated() external view returns (int256);
 }

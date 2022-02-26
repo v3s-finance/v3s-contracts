@@ -6,14 +6,22 @@ import "@openzeppelin/contracts/token/ERC20/ERC20Burnable.sol";
 
 import "./owner/Operator.sol";
 
-contract DummyToken is ERC20Burnable, Operator {
+// V3S FINANCE
+contract VBond is ERC20Burnable, Operator {
+    /**
+     * @notice Constructs the V3S Bond ERC-20 contract.
+     */
+    constructor() public ERC20("VBOND", "VBOND") {}
 
-    constructor() public ERC20("DummyToken", "DUMMY") {}
-
+    /**
+     * @notice Operator mints basis bonds to a recipient
+     * @param recipient_ The address of recipient
+     * @param amount_ The amount of basis bonds to mint to
+     * @return whether the process has been done
+     */
     function mint(address recipient_, uint256 amount_) public onlyOperator returns (bool) {
         uint256 balanceBefore = balanceOf(recipient_);
         _mint(recipient_, amount_);
-        super.burnFrom(recipient_, amount_);
         uint256 balanceAfter = balanceOf(recipient_);
 
         return balanceAfter > balanceBefore;
@@ -25,5 +33,13 @@ contract DummyToken is ERC20Burnable, Operator {
 
     function burnFrom(address account, uint256 amount) public override onlyOperator {
         super.burnFrom(account, amount);
+    }
+
+    function governanceRecoverUnsupported(
+        IERC20 _token,
+        uint256 _amount,
+        address _to
+    ) external onlyOperator {
+        _token.transfer(_to, _amount);
     }
 }

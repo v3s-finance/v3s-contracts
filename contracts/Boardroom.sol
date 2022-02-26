@@ -41,7 +41,7 @@ contract ShareWrapper {
     }
 }
 
-// UNITE FINANCE
+// V3S FINANCE
 contract Boardroom is ShareWrapper, ContractGuard {
     using SafeERC20 for IERC20;
     using Address for address;
@@ -69,14 +69,13 @@ contract Boardroom is ShareWrapper, ContractGuard {
     // flags
     bool public initialized = false;
 
-    IERC20 public kitty;
+    IERC20 public v3s;
     ITreasury public treasury;
 
     mapping(address => Memberseat) public members;
     BoardroomSnapshot[] public boardroomHistory;
 
     uint256 public withdrawLockupEpochs;
-    uint256 public rewardLockupEpochs;
 
     /* ========== EVENTS ========== */
 
@@ -85,6 +84,7 @@ contract Boardroom is ShareWrapper, ContractGuard {
     event Withdrawn(address indexed user, uint256 amount);
     event RewardPaid(address indexed user, uint256 reward);
     event RewardAdded(address indexed user, uint256 reward);
+    event RewardSacrificed(address indexed user, uint256 reward);
 
     /* ========== Modifiers =============== */
 
@@ -116,19 +116,18 @@ contract Boardroom is ShareWrapper, ContractGuard {
     /* ========== GOVERNANCE ========== */
 
     function initialize(
-        IERC20 _kitty,
+        IERC20 _v3s,
         IERC20 _share,
         ITreasury _treasury
     ) public notInitialized {
-        kitty = _kitty;
+        v3s = _v3s;
         share = _share;
         treasury = _treasury;
 
         BoardroomSnapshot memory genesisSnapshot = BoardroomSnapshot({time: block.number, rewardReceived: 0, rewardPerShare: 0});
         boardroomHistory.push(genesisSnapshot);
 
-        withdrawLockupEpochs = 6; // Lock for 6 epochs (36h) before release withdraw
-        rewardLockupEpochs = 3; // Lock for 3 epochs (18h) before release claimReward
+        withdrawLockupEpochs = 12; // Lock for 12 epochs (72h) before release withdraw
 
         initialized = true;
         operator = msg.sender;
@@ -139,10 +138,9 @@ contract Boardroom is ShareWrapper, ContractGuard {
         operator = _operator;
     }
 
-    function setLockUp(uint256 _withdrawLockupEpochs, uint256 _rewardLockupEpochs) external onlyOperator {
-        require(_withdrawLockupEpochs >= _rewardLockupEpochs && _withdrawLockupEpochs <= 56, "_withdrawLockupEpochs: out of range"); // <= 2 week
+    function setLockUp(uint256 _withdrawLockupEpochs) external onlyOperator {
+        require(_withdrawLockupEpochs <= 56, "_withdrawLockupEpochs: out of range"); // <= 2 week
         withdrawLockupEpochs = _withdrawLockupEpochs;
-        rewardLockupEpochs = _rewardLockupEpochs;
     }
 
     /* ========== VIEW FUNCTIONS ========== */
@@ -165,12 +163,13 @@ contract Boardroom is ShareWrapper, ContractGuard {
         return boardroomHistory[getLastSnapshotIndexOf(member)];
     }
 
-    function canWithdraw(address member) external view returns (bool) {
-        return members[member].epochTimerStart.add(withdrawLockupEpochs) <= treasury.epoch();
+    function canClaimReward() public view returns (bool) {
+        ITreasury _treasury = ITreasury(treasury);
+        return _treasury.previousEpochV3sPrice() >= 1e18 && _treasury.getNextExpansionRate() > 0; // current epoch and next epoch are both expansion
     }
 
-    function canClaimReward(address member) external view returns (bool) {
-        return members[member].epochTimerStart.add(rewardLockupEpochs) <= treasury.epoch();
+    function canWithdraw(address member) external view returns (bool) {
+        return members[member].epochTimerStart.add(withdrawLockupEpochs) <= treasury.epoch();
     }
 
     function epoch() external view returns (uint256) {
@@ -181,8 +180,8 @@ contract Boardroom is ShareWrapper, ContractGuard {
         return treasury.nextEpochPoint();
     }
 
-    function getUnitePrice() external view returns (uint256) {
-        return treasury.getUnitePrice();
+    function getV3sPrice() external view returns (uint256) {
+        return treasury.getV3sPrice();
     }
 
     // =========== Member getters
@@ -202,6 +201,9 @@ contract Boardroom is ShareWrapper, ContractGuard {
 
     function stake(uint256 amount) public override onlyOneBlock updateReward(msg.sender) {
         require(amount > 0, "Boardroom: Cannot stake 0");
+        if (members[msg.sender].rewardEarned > 0) {
+            claimReward();
+        }
         super.stake(amount);
         members[msg.sender].epochTimerStart = treasury.epoch(); // reset timer
         emit Staked(msg.sender, amount);
@@ -210,7 +212,7 @@ contract Boardroom is ShareWrapper, ContractGuard {
     function withdraw(uint256 amount) public override onlyOneBlock memberExists updateReward(msg.sender) {
         require(amount > 0, "Boardroom: Cannot withdraw 0");
         require(members[msg.sender].epochTimerStart.add(withdrawLockupEpochs) <= treasury.epoch(), "Boardroom: still in withdraw lockup");
-        claimReward();
+        _sacrificeReward();
         super.withdraw(amount);
         emit Withdrawn(msg.sender, amount);
     }
@@ -219,13 +221,22 @@ contract Boardroom is ShareWrapper, ContractGuard {
         withdraw(balanceOf(msg.sender));
     }
 
-    function claimReward() public updateReward(msg.sender) {
+    function _sacrificeReward() internal updateReward(msg.sender) {
         uint256 reward = members[msg.sender].rewardEarned;
         if (reward > 0) {
-            require(members[msg.sender].epochTimerStart.add(rewardLockupEpochs) <= treasury.epoch(), "Boardroom: still in reward lockup");
+            members[msg.sender].rewardEarned = 0;
+            IBasisAsset(address(v3s)).burn(reward);
+            emit RewardSacrificed(msg.sender, reward);
+        }
+    }
+
+    function claimReward() public updateReward(msg.sender) {
+        require(canClaimReward(), "contraction");
+        uint256 reward = members[msg.sender].rewardEarned;
+        if (reward > 0) {
             members[msg.sender].epochTimerStart = treasury.epoch(); // reset timer
             members[msg.sender].rewardEarned = 0;
-            kitty.safeTransfer(msg.sender, reward);
+            v3s.safeTransfer(msg.sender, reward);
             emit RewardPaid(msg.sender, reward);
         }
     }
@@ -241,7 +252,7 @@ contract Boardroom is ShareWrapper, ContractGuard {
         BoardroomSnapshot memory newSnapshot = BoardroomSnapshot({time: block.number, rewardReceived: amount, rewardPerShare: nextRPS});
         boardroomHistory.push(newSnapshot);
 
-        kitty.safeTransferFrom(msg.sender, address(this), amount);
+        v3s.safeTransferFrom(msg.sender, address(this), amount);
         emit RewardAdded(msg.sender, amount);
     }
 
@@ -251,8 +262,8 @@ contract Boardroom is ShareWrapper, ContractGuard {
         address _to
     ) external onlyOperator {
         // do not allow to drain core tokens
-        require(address(_token) != address(kitty), "kitty");
-        require(address(_token) != address(share), "cat");
+        require(address(_token) != address(v3s), "v3s");
+        require(address(_token) != address(share), "share");
         _token.safeTransfer(_to, _amount);
     }
 }

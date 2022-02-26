@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-pragma solidity ^0.6.0;
+pragma solidity 0.6.12;
 
 interface IBasisAsset {
     function mint(address recipient, uint256 amount) external returns (bool);
@@ -14,4 +14,6 @@ interface IBasisAsset {
     function operator() external view returns (address);
 
     function transferOperator(address newOperator_) external;
+
+    function transferOwnership(address newOwner_) external;
 }

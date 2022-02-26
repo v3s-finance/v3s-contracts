@@ -10,19 +10,18 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "./lib/Babylonian.sol";
 import "./owner/Operator.sol";
 import "./utils/ContractGuard.sol";
+import "./interfaces/ITreasury.sol";
 import "./interfaces/IBasisAsset.sol";
 import "./interfaces/IOracle.sol";
 import "./interfaces/IBoardroom.sol";
+import "./interfaces/IRegulationStats.sol";
+import "./interfaces/IRewardPool.sol";
 
-// UNITE FINANCE
-contract Treasury is ContractGuard {
+// V3S FINANCE
+contract Treasury is ITreasury, ContractGuard, ReentrancyGuard {
     using SafeERC20 for IERC20;
     using Address for address;
     using SafeMath for uint256;
-
-    /* ========= CONSTANT VARIABLES ======== */
-
-    uint256 public constant PERIOD = 6 hours;
 
     /* ========== STATE VARIABLES ========== */
 
@@ -34,25 +33,25 @@ contract Treasury is ContractGuard {
 
     // epoch
     uint256 public startTime;
-    uint256 public epoch = 0;
+    uint256 public lastEpochTime;
+    uint256 private epoch_ = 0;
+    uint256 private epochLength_ = 0;
     uint256 public epochSupplyContractionLeft = 0;
 
     // core components
-    address public kitty;
-    address public bbond;
-    address public bshare;
+    address public v3s;
+    address public vbond;
 
-    address public boardroom;
-    address public kittyOracle;
+    address public override boardroom;
+    address public v3sOracle;
 
     // price
-    uint256 public kittyPriceOne;
-    uint256 public kittyPriceCeiling;
+    uint256 public v3sPriceOne;
+    uint256 public v3sPriceCeiling;
 
     uint256 public seigniorageSaved;
 
-    uint256[] public supplyTiers;
-    uint256[] public maxExpansionTiers;
+    uint256 public nextSupplyTarget;
 
     uint256 public maxSupplyExpansionPercent;
     uint256 public bondDepletionFloorPercent;
@@ -60,38 +59,43 @@ contract Treasury is ContractGuard {
     uint256 public maxSupplyContractionPercent;
     uint256 public maxDebtRatioPercent;
 
-    // 28 first epochs (1 week) with 4.5% expansion regardless of UNITE price
+    // 28 first epochs (1 week) with 4.5% expansion regardless of V3S price
     uint256 public bootstrapEpochs;
     uint256 public bootstrapSupplyExpansionPercent;
 
-    /* =================== Added variables =================== */
-    uint256 public previousEpochUnitePrice;
+    uint256 public override previousEpochV3sPrice;
+    uint256 public allocateSeigniorageSalary;
     uint256 public maxDiscountRate; // when purchasing bond
     uint256 public maxPremiumRate; // when redeeming bond
     uint256 public discountPercent;
-    uint256 public premiumThreshold;
     uint256 public premiumPercent;
-    uint256 public mintingFactorForPayingDebt; // print extra UNITE during debt phase
+    uint256 public mintingFactorForPayingDebt; // print extra V3S during debt phase
 
-    address public daoFund;
-    uint256 public daoFundSharedPercent;
+    address public override daoFund;
+    uint256 public override daoFundSharedPercent; // 3000 (30%)
 
-    address public devFund;
-    uint256 public devFundSharedPercent;
-    address public team1Fund;
-    uint256 public team1FundSharedPercent;
+    address public override marketingFund;
+    uint256 public override marketingFundSharedPercent; // 1000 (10%)
+
+    address public override insuranceFund;
+    uint256 public override insuranceFundSharedPercent; // 2000 (20%)
+
+    address public regulationStats;
+    address public vshareRewardPool;
+    uint256 public vshareRewardPoolExpansionRate;
+    uint256 public vshareRewardPoolContractionRate;
+
+    /* =================== Added variables =================== */
+    // ...
 
     /* =================== Events =================== */
 
     event Initialized(address indexed executor, uint256 at);
     event BurnedBonds(address indexed from, uint256 bondAmount);
-    event RedeemedBonds(address indexed from, uint256 kittyAmount, uint256 bondAmount);
-    event BoughtBonds(address indexed from, uint256 kittyAmount, uint256 bondAmount);
+    event RedeemedBonds(address indexed from, uint256 v3sAmount, uint256 bondAmount);
+    event BoughtBonds(address indexed from, uint256 v3sAmount, uint256 bondAmount);
     event TreasuryFunded(uint256 timestamp, uint256 seigniorage);
-    event BoardroomFunded(uint256 timestamp, uint256 seigniorage);
-    event DaoFundFunded(uint256 timestamp, uint256 seigniorage);
-    event DevFundFunded(uint256 timestamp, uint256 seigniorage);
-    event TeamFundFunded(uint256 timestamp, uint256 seigniorage);
+    event FundingAdded(uint256 indexed epoch, uint256 timestamp, uint256 price, uint256 expanded, uint256 boardroomFunded, uint256 daoFunded, uint256 marketingFunded, uint256 insuranceFund);
 
     /* =================== Modifier =================== */
 
@@ -100,26 +104,21 @@ contract Treasury is ContractGuard {
         _;
     }
 
-    modifier checkCondition() {
-        require(now >= startTime, "Treasury: not started yet");
-
-        _;
-    }
-
     modifier checkEpoch() {
-        require(now >= nextEpochPoint(), "Treasury: not opened yet");
+        uint256 _nextEpochPoint = nextEpochPoint();
+        require(now >= _nextEpochPoint, "Treasury: not opened yet");
 
         _;
 
-        epoch = epoch.add(1);
-        epochSupplyContractionLeft = (getUnitePrice() > kittyPriceCeiling) ? 0 : getUniteCirculatingSupply().mul(maxSupplyContractionPercent).div(10000);
+        lastEpochTime = _nextEpochPoint;
+        epoch_ = epoch_.add(1);
+        epochSupplyContractionLeft = (getV3sPrice() > v3sPriceCeiling) ? 0 : IERC20(v3s).totalSupply().mul(maxSupplyContractionPercent).div(10000);
     }
 
     modifier checkOperator() {
         require(
-            IBasisAsset(kitty).operator() == address(this) &&
-                IBasisAsset(bbond).operator() == address(this) &&
-                IBasisAsset(bshare).operator() == address(this) &&
+            IBasisAsset(v3s).operator() == address(this) &&
+                IBasisAsset(vbond).operator() == address(this) &&
                 Operator(boardroom).operator() == address(this),
             "Treasury: need more permission"
         );
@@ -140,67 +139,86 @@ contract Treasury is ContractGuard {
     }
 
     // epoch
-    function nextEpochPoint() public view returns (uint256) {
-        return startTime.add(epoch.mul(PERIOD));
+    function epoch() public override view returns (uint256) {
+        return epoch_;
+    }
+
+    function nextEpochPoint() public override view returns (uint256) {
+        return lastEpochTime.add(nextEpochLength());
+    }
+
+    function nextEpochLength() public override view returns (uint256) {
+        return epochLength_;
+    }
+
+    function getPegPrice() external override view returns (int256) {
+        return IOracle(v3sOracle).getPegPrice();
+    }
+
+    function getPegPriceUpdated() external override view returns (int256) {
+        return IOracle(v3sOracle).getPegPriceUpdated();
     }
 
     // oracle
-    function getUnitePrice() public view returns (uint256 kittyPrice) {
-        try IOracle(kittyOracle).consult(kitty, 1e18) returns (uint144 price) {
+    function getV3sPrice() public override view returns (uint256 v3sPrice) {
+        try IOracle(v3sOracle).consult(v3s, 1e18) returns (uint144 price) {
             return uint256(price);
         } catch {
-            revert("Treasury: failed to consult UNITE price from the oracle");
+            revert("Treasury: failed to consult V3S price from the oracle");
         }
     }
 
-    function getUniteUpdatedPrice() public view returns (uint256 _kittyPrice) {
-        try IOracle(kittyOracle).twap(kitty, 1e18) returns (uint144 price) {
+    function getV3sUpdatedPrice() public override view returns (uint256 _v3sPrice) {
+        try IOracle(v3sOracle).twap(v3s, 1e18) returns (uint144 price) {
             return uint256(price);
         } catch {
-            revert("Treasury: failed to consult UNITE price from the oracle");
+            revert("Treasury: failed to consult V3S price from the oracle");
         }
+    }
+
+    function boardroomSharedPercent() external override view returns (uint256) {
+        return uint256(10000).sub(daoFundSharedPercent).sub(marketingFundSharedPercent).sub(insuranceFundSharedPercent);
     }
 
     // budget
-    function getReserve() public view returns (uint256) {
+    function getReserve() external view returns (uint256) {
         return seigniorageSaved;
     }
 
-    function getBurnableUniteLeft() public view returns (uint256 _burnableUniteLeft) {
-        uint256 _kittyPrice = getUnitePrice();
-        if (_kittyPrice <= kittyPriceOne) {
-            uint256 _kittySupply = getUniteCirculatingSupply();
-            uint256 _bondMaxSupply = _kittySupply.mul(maxDebtRatioPercent).div(10000);
-            uint256 _bondSupply = IERC20(bbond).totalSupply();
+    function getBurnableV3sLeft() external view returns (uint256 _burnableV3sLeft) {
+        uint256 _v3sPrice = getV3sPrice();
+        if (_v3sPrice <= v3sPriceOne) {
+            uint256 _bondMaxSupply = IERC20(v3s).totalSupply().mul(maxDebtRatioPercent).div(10000);
+            uint256 _bondSupply = IERC20(vbond).totalSupply();
             if (_bondMaxSupply > _bondSupply) {
                 uint256 _maxMintableBond = _bondMaxSupply.sub(_bondSupply);
-                uint256 _maxBurnableUnite = _maxMintableBond.mul(_kittyPrice).div(1e18);
-                _burnableUniteLeft = Math.min(epochSupplyContractionLeft, _maxBurnableUnite);
+                uint256 _maxBurnableV3s = _maxMintableBond.mul(getBondDiscountRate()).div(1e18);
+                _burnableV3sLeft = Math.min(epochSupplyContractionLeft, _maxBurnableV3s);
             }
         }
     }
 
-    function getRedeemableBonds() public view returns (uint256 _redeemableBonds) {
-        uint256 _kittyPrice = getUnitePrice();
-        if (_kittyPrice > kittyPriceCeiling) {
-            uint256 _totalUnite = IERC20(kitty).balanceOf(address(this));
+    function getRedeemableBonds() external view returns (uint256 _redeemableBonds) {
+        uint256 _v3sPrice = getV3sPrice();
+        if (_v3sPrice > v3sPriceCeiling) {
+            uint256 _totalV3s = IERC20(v3s).balanceOf(address(this));
             uint256 _rate = getBondPremiumRate();
             if (_rate > 0) {
-                _redeemableBonds = _totalUnite.mul(1e18).div(_rate);
+                _redeemableBonds = _totalV3s.mul(1e18).div(_rate);
             }
         }
     }
 
-    function getBondDiscountRate() public view returns (uint256 _rate) {
-        uint256 _kittyPrice = getUnitePrice();
-        if (_kittyPrice <= kittyPriceOne) {
+    function getBondDiscountRate() public override view returns (uint256 _rate) {
+        uint256 _v3sPrice = getV3sPrice();
+        if (_v3sPrice <= v3sPriceOne) {
             if (discountPercent == 0) {
                 // no discount
-                _rate = kittyPriceOne;
+                _rate = v3sPriceOne;
             } else {
-                uint256 _bondAmount = kittyPriceOne.mul(1e18).div(_kittyPrice); // to burn 1 UNITE
-                uint256 _discountAmount = _bondAmount.sub(kittyPriceOne).mul(discountPercent).div(10000);
-                _rate = kittyPriceOne.add(_discountAmount);
+                uint256 _bondAmount = v3sPriceOne.mul(1e18).div(_v3sPrice); // to burn 1 V3S
+                uint256 _discountAmount = _bondAmount.sub(v3sPriceOne).mul(discountPercent).div(10000);
+                _rate = v3sPriceOne.add(_discountAmount);
                 if (maxDiscountRate > 0 && _rate > maxDiscountRate) {
                     _rate = maxDiscountRate;
                 }
@@ -208,64 +226,88 @@ contract Treasury is ContractGuard {
         }
     }
 
-    function getBondPremiumRate() public view returns (uint256 _rate) {
-        uint256 _kittyPrice = getUnitePrice();
-        if (_kittyPrice > kittyPriceCeiling) {
-            uint256 _kittyPricePremiumThreshold = kittyPriceOne.mul(premiumThreshold).div(100);
-            if (_kittyPrice >= _kittyPricePremiumThreshold) {
-                //Price > 1.10
-                uint256 _premiumAmount = _kittyPrice.sub(kittyPriceOne).mul(premiumPercent).div(10000);
-                _rate = kittyPriceOne.add(_premiumAmount);
-                if (maxPremiumRate > 0 && _rate > maxPremiumRate) {
-                    _rate = maxPremiumRate;
-                }
-            } else {
+    function getBondPremiumRate() public override view returns (uint256 _rate) {
+        uint256 _v3sPrice = getV3sPrice();
+        if (_v3sPrice > v3sPriceCeiling) {
+            if (premiumPercent == 0) {
                 // no premium bonus
-                _rate = kittyPriceOne;
+                _rate = v3sPriceOne;
+            } else {
+                uint256 _premiumAmount = _v3sPrice.sub(v3sPriceOne).mul(premiumPercent).div(10000);
+                _rate = v3sPriceOne.add(_premiumAmount);
+                if (maxDiscountRate > 0 && _rate > maxDiscountRate) {
+                    _rate = maxDiscountRate;
+                }
             }
         }
+    }
+
+    function getNextExpansionRate() public override view returns (uint256 _rate) {
+        if (epoch_ < bootstrapEpochs) {// 28 first epochs with 4.5% expansion
+            _rate = bootstrapSupplyExpansionPercent;
+        } else {
+            uint256 _twap = getV3sUpdatedPrice();
+            if (_twap >= v3sPriceCeiling) {
+                uint256 _percentage = _twap.sub(v3sPriceOne); // 1% = 1e16
+                uint256 _mse = maxSupplyExpansionPercent.mul(1e14);
+                if (_percentage > _mse) {
+                    _percentage = _mse;
+                }
+                _rate = _percentage.div(1e12);
+            }
+        }
+    }
+
+    function getNextExpansionAmount() external override view returns (uint256) {
+        uint256 _rate = getNextExpansionRate();
+        return IERC20(v3s).totalSupply().mul(_rate).div(1e6);
     }
 
     /* ========== GOVERNANCE ========== */
 
     function initialize(
-        address _kitty,
-        address _bbond,
-        address _bshare,
-        address _kittyOracle,
+        address _v3s,
+        address _vbond,
+        address _v3sOracle,
         address _boardroom,
         uint256 _startTime
     ) public notInitialized {
-        kitty = _kitty;
-        bbond = _bbond;
-        bshare = _bshare;
-        kittyOracle = _kittyOracle;
+        v3s = _v3s;
+        vbond = _vbond;
+        v3sOracle = _v3sOracle;
         boardroom = _boardroom;
+
         startTime = _startTime;
+        epochLength_ = 6 hours;
+        lastEpochTime = _startTime.sub(6 hours);
 
-        kittyPriceOne = 10**18; // This is to allow a PEG of 1 UNITE per AVAX
-        kittyPriceCeiling = kittyPriceOne.mul(101).div(100);
+        v3sPriceOne = 10**18; // This is to allow a PEG of 1 V3S per VVS
+        v3sPriceCeiling = v3sPriceOne.mul(1001).div(1000);
 
-        // Dynamic max expansion percent
-        supplyTiers = [0 ether, 2000000 ether, 4000000 ether, 6000000 ether, 8000000 ether, 20000000 ether, 40000000 ether, 80000000 ether, 200000000 ether];
-        maxExpansionTiers = [450, 400, 350, 300, 250, 200, 150, 125, 100];
-
-        maxSupplyExpansionPercent = 400; // Upto 4.0% supply for expansion
+        maxSupplyExpansionPercent = 300; // Upto 3.0% supply for expansion
 
         bondDepletionFloorPercent = 10000; // 100% of Bond supply for depletion floor
         seigniorageExpansionFloorPercent = 3500; // At least 35% of expansion reserved for boardroom
-        maxSupplyContractionPercent = 300; // Upto 3.0% supply for contraction (to burn UNITE and mint tBOND)
-        maxDebtRatioPercent = 4500; // Upto 35% supply of tBOND to purchase
+        maxSupplyContractionPercent = 300; // Upto 3.0% supply for contraction (to burn V3S and mint VBOND)
+        maxDebtRatioPercent = 4500; // Upto 35% supply of VBOND to purchase
 
-        premiumThreshold = 110;
-        premiumPercent = 7000;
+        maxDiscountRate = 13e17; // 30% - when purchasing bond
+        maxPremiumRate = 13e17; // 30% - when redeeming bond
+
+        discountPercent = 0; // no discount
+        premiumPercent = 6500; // 65% premium
 
         // First 28 epochs with 4.5% expansion
-        bootstrapEpochs = 0;
+        bootstrapEpochs = 28;
         bootstrapSupplyExpansionPercent = 450;
 
         // set seigniorageSaved to it's balance
-        seigniorageSaved = IERC20(kitty).balanceOf(address(this));
+        seigniorageSaved = IERC20(v3s).balanceOf(address(this));
+
+        nextSupplyTarget = 2000000000 ether; // 2B supply is the next target to reduce expansion rate
+
+        vshareRewardPoolExpansionRate = 0.138888888888888888 ether; // 12000000 vshare / (1000 days * 24h * 60min * 60s)
+        vshareRewardPoolContractionRate = 0.2777777777777778 ether; // 2x
 
         initialized = true;
         operator = msg.sender;
@@ -276,43 +318,48 @@ contract Treasury is ContractGuard {
         operator = _operator;
     }
 
+    function resetStartTime(uint256 _startTime) external onlyOperator {
+        require(epoch_ == 0, "already started");
+        startTime = _startTime;
+        lastEpochTime = _startTime.sub(epochLength_);
+    }
+
+    function setEpochLength(uint256 _epochLength) external onlyOperator {
+        require(_epochLength >= 1 hours && _epochLength <= 24 hours, "out of range");
+        epochLength_ = _epochLength;
+    }
+
     function setBoardroom(address _boardroom) external onlyOperator {
         boardroom = _boardroom;
     }
 
-    function setUniteOracle(address _kittyOracle) external onlyOperator {
-        kittyOracle = _kittyOracle;
+    function setRegulationStats(address _regulationStats) external onlyOperator {
+        regulationStats = _regulationStats;
     }
 
-    function setUnitePriceCeiling(uint256 _kittyPriceCeiling) external onlyOperator {
-        require(_kittyPriceCeiling >= kittyPriceOne && _kittyPriceCeiling <= kittyPriceOne.mul(120).div(100), "out of range"); // [$1.0, $1.2]
-        kittyPriceCeiling = _kittyPriceCeiling;
+    function setVshareRewardPool(address _vshareRewardPool) external onlyOperator {
+        vshareRewardPool = _vshareRewardPool;
+    }
+
+    function setVshareRewardPoolRates(uint256 _vshareRewardPoolExpansionRate, uint256 _vshareRewardPoolContractionRate) external onlyOperator {
+        require(_vshareRewardPoolExpansionRate <= 0.5 ether && _vshareRewardPoolExpansionRate <= 0.5 ether, "too high");
+        require(_vshareRewardPoolContractionRate >= 0.05 ether && _vshareRewardPoolContractionRate >= 0.05 ether, "too low");
+        vshareRewardPoolExpansionRate = _vshareRewardPoolExpansionRate;
+        vshareRewardPoolContractionRate = _vshareRewardPoolContractionRate;
+    }
+
+    function setV3sOracle(address _v3sOracle) external onlyOperator {
+        v3sOracle = _v3sOracle;
+    }
+
+    function setV3sPriceCeiling(uint256 _v3sPriceCeiling) external onlyOperator {
+        require(_v3sPriceCeiling >= v3sPriceOne && _v3sPriceCeiling <= v3sPriceOne.mul(120).div(100), "out of range"); // [$1.0, $1.2]
+        v3sPriceCeiling = _v3sPriceCeiling;
     }
 
     function setMaxSupplyExpansionPercents(uint256 _maxSupplyExpansionPercent) external onlyOperator {
         require(_maxSupplyExpansionPercent >= 10 && _maxSupplyExpansionPercent <= 1000, "_maxSupplyExpansionPercent: out of range"); // [0.1%, 10%]
         maxSupplyExpansionPercent = _maxSupplyExpansionPercent;
-    }
-
-    function setSupplyTiersEntry(uint8 _index, uint256 _value) external onlyOperator returns (bool) {
-        require(_index >= 0, "Index has to be higher than 0");
-        require(_index < 9, "Index has to be lower than count of tiers");
-        if (_index > 0) {
-            require(_value > supplyTiers[_index - 1]);
-        }
-        if (_index < 8) {
-            require(_value < supplyTiers[_index + 1]);
-        }
-        supplyTiers[_index] = _value;
-        return true;
-    }
-
-    function setMaxExpansionTiersEntry(uint8 _index, uint256 _value) external onlyOperator returns (bool) {
-        require(_index >= 0, "Index has to be higher than 0");
-        require(_index < 9, "Index has to be lower than count of tiers");
-        require(_value >= 10 && _value <= 1000, "_value: out of range"); // [0.1%, 10%]
-        maxExpansionTiers[_index] = _value;
-        return true;
     }
 
     function setBondDepletionFloorPercent(uint256 _bondDepletionFloorPercent) external onlyOperator {
@@ -340,23 +387,28 @@ contract Treasury is ContractGuard {
     function setExtraFunds(
         address _daoFund,
         uint256 _daoFundSharedPercent,
-        address _devFund,
-        uint256 _devFundSharedPercent,
-        address _team1Fund,
-        uint256 _team1FundSharedPercent
+        address _marketingFund,
+        uint256 _marketingFundSharedPercent,
+        address _insuranceFund,
+        uint256 _insuranceFundSharedPercent
     ) external onlyOperator {
-        require(_daoFund != address(0), "zero");
-        require(_daoFundSharedPercent <= 3000, "out of range"); // <= 30%
-        require(_devFund != address(0), "zero");
-        require(_devFundSharedPercent <= 500, "out of range"); // <= 5%
-        require(_team1Fund != address(0), "zero");
-        require(_team1FundSharedPercent <= 500, "out of range"); // <= 5%
+        require(_daoFundSharedPercent == 0 || _daoFund != address(0), "zero");
+        require(_daoFundSharedPercent <= 4000, "out of range"); // <= 40%
+        require(_marketingFundSharedPercent == 0 || _marketingFund != address(0), "zero");
+        require(_marketingFundSharedPercent <= 2000, "out of range"); // <= 20%
+        require(_insuranceFundSharedPercent == 0 || _insuranceFund != address(0), "zero");
+        require(_insuranceFundSharedPercent <= 3000, "out of range"); // <= 30%
         daoFund = _daoFund;
         daoFundSharedPercent = _daoFundSharedPercent;
-        devFund = _devFund;
-        devFundSharedPercent = _devFundSharedPercent;
-        team1Fund = _team1Fund;
-        team1FundSharedPercent = _team1FundSharedPercent;
+        marketingFund = _marketingFund;
+        marketingFundSharedPercent = _marketingFundSharedPercent;
+        insuranceFund = _insuranceFund;
+        insuranceFundSharedPercent = _insuranceFundSharedPercent;
+    }
+
+    function setAllocateSeigniorageSalary(uint256 _allocateSeigniorageSalary) external onlyOperator {
+        require(_allocateSeigniorageSalary <= 10000 ether, "Treasury: dont pay too much");
+        allocateSeigniorageSalary = _allocateSeigniorageSalary;
     }
 
     function setMaxDiscountRate(uint256 _maxDiscountRate) external onlyOperator {
@@ -372,12 +424,6 @@ contract Treasury is ContractGuard {
         discountPercent = _discountPercent;
     }
 
-    function setPremiumThreshold(uint256 _premiumThreshold) external onlyOperator {
-        require(_premiumThreshold >= kittyPriceCeiling, "_premiumThreshold exceeds kittyPriceCeiling");
-        require(_premiumThreshold <= 150, "_premiumThreshold is higher than 1.5");
-        premiumThreshold = _premiumThreshold;
-    }
-
     function setPremiumPercent(uint256 _premiumPercent) external onlyOperator {
         require(_premiumPercent <= 20000, "_premiumPercent is over 200%");
         premiumPercent = _premiumPercent;
@@ -388,140 +434,145 @@ contract Treasury is ContractGuard {
         mintingFactorForPayingDebt = _mintingFactorForPayingDebt;
     }
 
+    function setNextSupplyTarget(uint256 _target) external onlyOperator {
+        require(_target > IERC20(v3s).totalSupply(), "too small");
+        nextSupplyTarget = _target;
+    }
+
     /* ========== MUTABLE FUNCTIONS ========== */
 
-    function _updateUnitePrice() internal {
-        try IOracle(kittyOracle).update() {} catch {}
+    function _updateV3sPrice() internal {
+        try IOracle(v3sOracle).update() {} catch {}
     }
 
-    function getUniteCirculatingSupply() public view returns (uint256) {
-        IERC20 kittyErc20 = IERC20(kitty);
-        uint256 totalSupply = kittyErc20.totalSupply();
-        uint256 balanceExcluded = 0;
-        return totalSupply.sub(balanceExcluded);
-    }
+    function buyBonds(uint256 _v3sAmount, uint256 targetPrice) external override onlyOneBlock checkOperator nonReentrant {
+        require(_v3sAmount > 0, "Treasury: cannot purchase bonds with zero amount");
 
-    function buyBonds(uint256 _kittyAmount, uint256 targetPrice) external onlyOneBlock checkCondition checkOperator {
-        require(_kittyAmount > 0, "Treasury: cannot purchase bonds with zero amount");
-
-        uint256 kittyPrice = getUnitePrice();
-        require(kittyPrice == targetPrice, "Treasury: UNITE price moved");
+        uint256 v3sPrice = getV3sPrice();
+        require(v3sPrice == targetPrice, "Treasury: V3S price moved");
         require(
-            kittyPrice < kittyPriceOne, // price < $1
-            "Treasury: kittyPrice not eligible for bond purchase"
+            v3sPrice < v3sPriceOne, // price < $1
+            "Treasury: v3sPrice not eligible for bond purchase"
         );
 
-        require(_kittyAmount <= epochSupplyContractionLeft, "Treasury: not enough bond left to purchase");
+        require(_v3sAmount <= epochSupplyContractionLeft, "Treasury: not enough bond left to purchase");
 
         uint256 _rate = getBondDiscountRate();
         require(_rate > 0, "Treasury: invalid bond rate");
 
-        uint256 _bondAmount = _kittyAmount.mul(_rate).div(1e18);
-        uint256 kittySupply = getUniteCirculatingSupply();
-        uint256 newBondSupply = IERC20(bbond).totalSupply().add(_bondAmount);
-        require(newBondSupply <= kittySupply.mul(maxDebtRatioPercent).div(10000), "over max debt ratio");
+        address _v3s = v3s;
+        uint256 _bondAmount = _v3sAmount.mul(_rate).div(1e18);
+        uint256 _v3sSupply = IERC20(v3s).totalSupply();
+        uint256 newBondSupply = IERC20(vbond).totalSupply().add(_bondAmount);
+        require(newBondSupply <= _v3sSupply.mul(maxDebtRatioPercent).div(10000), "over max debt ratio");
 
-        IBasisAsset(kitty).burnFrom(msg.sender, _kittyAmount);
-        IBasisAsset(bbond).mint(msg.sender, _bondAmount);
+        IBasisAsset(_v3s).burnFrom(msg.sender, _v3sAmount);
+        IBasisAsset(vbond).mint(msg.sender, _bondAmount);
 
-        epochSupplyContractionLeft = epochSupplyContractionLeft.sub(_kittyAmount);
-        _updateUnitePrice();
+        epochSupplyContractionLeft = epochSupplyContractionLeft.sub(_v3sAmount);
+        _updateV3sPrice();
+        if (regulationStats != address(0)) IRegulationStats(regulationStats).addBonded(epoch_, _bondAmount);
 
-        emit BoughtBonds(msg.sender, _kittyAmount, _bondAmount);
+        emit BoughtBonds(msg.sender, _v3sAmount, _bondAmount);
     }
 
-    function redeemBonds(uint256 _bondAmount, uint256 targetPrice) external onlyOneBlock checkCondition checkOperator {
+    function redeemBonds(uint256 _bondAmount, uint256 targetPrice) external override onlyOneBlock checkOperator nonReentrant {
         require(_bondAmount > 0, "Treasury: cannot redeem bonds with zero amount");
 
-        uint256 kittyPrice = getUnitePrice();
-        require(kittyPrice == targetPrice, "Treasury: UNITE price moved");
+        uint256 v3sPrice = getV3sPrice();
+        require(v3sPrice == targetPrice, "Treasury: V3S price moved");
         require(
-            kittyPrice > kittyPriceCeiling, // price > $1.01
-            "Treasury: kittyPrice not eligible for bond purchase"
+            v3sPrice > v3sPriceCeiling, // price > $1.01
+            "Treasury: v3sPrice not eligible for bond purchase"
         );
 
         uint256 _rate = getBondPremiumRate();
         require(_rate > 0, "Treasury: invalid bond rate");
 
-        uint256 _kittyAmount = _bondAmount.mul(_rate).div(1e18);
-        require(IERC20(kitty).balanceOf(address(this)) >= _kittyAmount, "Treasury: treasury has no more budget");
+        uint256 _v3sAmount = _bondAmount.mul(_rate).div(1e18);
+        require(IERC20(v3s).balanceOf(address(this)) >= _v3sAmount, "Treasury: treasury has no more budget");
 
-        seigniorageSaved = seigniorageSaved.sub(Math.min(seigniorageSaved, _kittyAmount));
+        seigniorageSaved = seigniorageSaved.sub(Math.min(seigniorageSaved, _v3sAmount));
+        allocateSeigniorageSalary = 1000 ether; // 1000 V3S salary for calling allocateSeigniorage()
 
-        IBasisAsset(bbond).burnFrom(msg.sender, _bondAmount);
-        IERC20(kitty).safeTransfer(msg.sender, _kittyAmount);
+        IBasisAsset(vbond).burnFrom(msg.sender, _bondAmount);
+        IERC20(v3s).safeTransfer(msg.sender, _v3sAmount);
 
-        _updateUnitePrice();
+        _updateV3sPrice();
+        if (regulationStats != address(0)) IRegulationStats(regulationStats).addRedeemed(epoch_, _v3sAmount);
 
-        emit RedeemedBonds(msg.sender, _kittyAmount, _bondAmount);
+        emit RedeemedBonds(msg.sender, _v3sAmount, _bondAmount);
     }
 
-    function _sendToBoardroom(uint256 _amount) internal {
-        IBasisAsset(kitty).mint(address(this), _amount);
+    function _sendToBoardroom(uint256 _amount, uint256 _expanded) internal {
+        address _v3s = v3s;
+        IBasisAsset(_v3s).mint(address(this), _amount);
 
         uint256 _daoFundSharedAmount = 0;
         if (daoFundSharedPercent > 0) {
             _daoFundSharedAmount = _amount.mul(daoFundSharedPercent).div(10000);
-            IERC20(kitty).transfer(daoFund, _daoFundSharedAmount);
-            emit DaoFundFunded(now, _daoFundSharedAmount);
+            IERC20(_v3s).transfer(daoFund, _daoFundSharedAmount);
         }
 
-        uint256 _devFundSharedAmount = 0;
-        if (devFundSharedPercent > 0) {
-            _devFundSharedAmount = _amount.mul(devFundSharedPercent).div(10000);
-            IERC20(kitty).transfer(devFund, _devFundSharedAmount);
-            emit DevFundFunded(now, _devFundSharedAmount);
+        uint256 _marketingFundSharedAmount = 0;
+        if (marketingFundSharedPercent > 0) {
+            _marketingFundSharedAmount = _amount.mul(marketingFundSharedPercent).div(10000);
+            IERC20(_v3s).transfer(marketingFund, _marketingFundSharedAmount);
         }
 
-        uint256 _team1FundSharedAmount = 0;
-        if (team1FundSharedPercent > 0) {
-            _team1FundSharedAmount = _amount.mul(team1FundSharedPercent).div(10000);
-            IERC20(kitty).transfer(team1Fund, _team1FundSharedAmount);
-            emit TeamFundFunded(now, _team1FundSharedAmount);
+        uint256 _insuranceFundSharedAmount = 0;
+        if (insuranceFundSharedPercent > 0) {
+            _insuranceFundSharedAmount = _amount.mul(insuranceFundSharedPercent).div(10000);
+            IERC20(_v3s).transfer(insuranceFund, _insuranceFundSharedAmount);
         }
 
-        _amount = _amount.sub(_daoFundSharedAmount).sub(_devFundSharedAmount).sub(_team1FundSharedAmount);
+        _amount = _amount.sub(_daoFundSharedAmount).sub(_marketingFundSharedAmount).sub(_insuranceFundSharedAmount);
 
-        IERC20(kitty).safeApprove(boardroom, 0);
-        IERC20(kitty).safeApprove(boardroom, _amount);
+        IERC20(_v3s).safeIncreaseAllowance(boardroom, _amount);
         IBoardroom(boardroom).allocateSeigniorage(_amount);
-        emit BoardroomFunded(now, _amount);
+
+        if (regulationStats != address(0)) IRegulationStats(regulationStats).addEpochInfo(epoch_.add(1), previousEpochV3sPrice, _expanded,
+            _amount, _daoFundSharedAmount, _marketingFundSharedAmount, _insuranceFundSharedAmount);
+        emit FundingAdded(epoch_, block.timestamp, previousEpochV3sPrice, _expanded,
+            _amount, _daoFundSharedAmount, _marketingFundSharedAmount, _insuranceFundSharedAmount);
     }
 
-    function _calculateMaxSupplyExpansionPercent(uint256 _kittySupply) internal returns (uint256) {
-        for (uint8 tierId = 8; tierId >= 0; --tierId) {
-            if (_kittySupply >= supplyTiers[tierId]) {
-                maxSupplyExpansionPercent = maxExpansionTiers[tierId];
-                break;
+    function allocateSeigniorage() external onlyOneBlock checkEpoch checkOperator nonReentrant {
+        _updateV3sPrice();
+        previousEpochV3sPrice = getV3sPrice();
+        address _v3s = v3s;
+        uint256 _supply = IERC20(_v3s).totalSupply();
+        uint256 _nextSupplyTarget = nextSupplyTarget;
+        if (_supply >= _nextSupplyTarget) {
+            nextSupplyTarget = _nextSupplyTarget.mul(12500).div(10000); // +25%
+            maxSupplyExpansionPercent = maxSupplyExpansionPercent.mul(9500).div(10000); // -5%
+            if (maxSupplyExpansionPercent < 25) {
+                maxSupplyExpansionPercent = 25; // min 0.25%
             }
         }
-        return maxSupplyExpansionPercent;
-    }
-
-    function allocateSeigniorage() external onlyOneBlock checkCondition checkEpoch checkOperator {
-        _updateUnitePrice();
-        previousEpochUnitePrice = getUnitePrice();
-        uint256 kittySupply = getUniteCirculatingSupply().sub(seigniorageSaved);
-        if (epoch < bootstrapEpochs) {
+        uint256 _seigniorage;
+        if (epoch_ < bootstrapEpochs) {
             // 28 first epochs with 4.5% expansion
-            _sendToBoardroom(kittySupply.mul(bootstrapSupplyExpansionPercent).div(10000));
+            _seigniorage = _supply.mul(bootstrapSupplyExpansionPercent).div(10000);
+            _sendToBoardroom(_seigniorage, _seigniorage);
         } else {
-            if (previousEpochUnitePrice > kittyPriceCeiling) {
-                // Expansion ($UNITE Price > 1 $ETH): there is some seigniorage to be allocated
-                uint256 bondSupply = IERC20(bbond).totalSupply();
-                uint256 _percentage = previousEpochUnitePrice.sub(kittyPriceOne);
+            address _vshareRewardPool = vshareRewardPool;
+            if (previousEpochV3sPrice > v3sPriceCeiling) {
+                // Expansion ($V3S Price > 1 $ETH): there is some seigniorage to be allocated
+                uint256 bondSupply = IERC20(vbond).totalSupply();
+                uint256 _percentage = previousEpochV3sPrice.sub(v3sPriceOne);
                 uint256 _savedForBond;
                 uint256 _savedForBoardroom;
-                uint256 _mse = _calculateMaxSupplyExpansionPercent(kittySupply).mul(1e14);
+                uint256 _mse = maxSupplyExpansionPercent.mul(1e14);
                 if (_percentage > _mse) {
                     _percentage = _mse;
                 }
                 if (seigniorageSaved >= bondSupply.mul(bondDepletionFloorPercent).div(10000)) {
                     // saved enough to pay debt, mint as usual rate
-                    _savedForBoardroom = kittySupply.mul(_percentage).div(1e18);
+                    _savedForBoardroom = _supply.mul(_percentage).div(1e18);
                 } else {
                     // have not saved enough to pay debt, mint more
-                    uint256 _seigniorage = kittySupply.mul(_percentage).div(1e18);
+                    _seigniorage = _supply.mul(_percentage).div(1e18);
                     _savedForBoardroom = _seigniorage.mul(seigniorageExpansionFloorPercent).div(10000);
                     _savedForBond = _seigniorage.sub(_savedForBoardroom);
                     if (mintingFactorForPayingDebt > 0) {
@@ -529,46 +580,59 @@ contract Treasury is ContractGuard {
                     }
                 }
                 if (_savedForBoardroom > 0) {
-                    _sendToBoardroom(_savedForBoardroom);
+                    _sendToBoardroom(_savedForBoardroom, _seigniorage);
+                } else {
+                    // function addEpochInfo(uint256 epochNumber, uint256 twap, uint256 expanded, uint256 boardroomFunding, uint256 daoFunding, uint256 marketingFunding, uint256 insuranceFunding) external;
+                    if (regulationStats != address(0)) IRegulationStats(regulationStats).addEpochInfo(epoch_.add(1), previousEpochV3sPrice, 0, 0, 0, 0, 0);
+                    emit FundingAdded(epoch_, block.timestamp, previousEpochV3sPrice, 0, 0, 0, 0, 0);
                 }
                 if (_savedForBond > 0) {
                     seigniorageSaved = seigniorageSaved.add(_savedForBond);
-                    IBasisAsset(kitty).mint(address(this), _savedForBond);
+                    IBasisAsset(_v3s).mint(address(this), _savedForBond);
                     emit TreasuryFunded(now, _savedForBond);
+                }
+                if (_vshareRewardPool != address(0) && IRewardPool(_vshareRewardPool).getRewardPerSecond() != vshareRewardPoolExpansionRate) {
+                    IRewardPool(_vshareRewardPool).updateRewardRate(vshareRewardPoolExpansionRate);
+                }
+            } else if (previousEpochV3sPrice < v3sPriceOne) {
+                if (_vshareRewardPool != address(0) && IRewardPool(_vshareRewardPool).getRewardPerSecond() != vshareRewardPoolContractionRate) {
+                    IRewardPool(_vshareRewardPool).updateRewardRate(vshareRewardPoolContractionRate);
                 }
             }
         }
+        if (allocateSeigniorageSalary > 0) {
+            IBasisAsset(_v3s).mint(address(msg.sender), allocateSeigniorageSalary);
+        }
     }
 
-    function governanceRecoverUnsupported(
-        IERC20 _token,
-        uint256 _amount,
-        address _to
-    ) external onlyOperator {
+    function governanceRecoverUnsupported(IERC20 _token, uint256 _amount, address _to) external onlyOperator {
         // do not allow to drain core tokens
-        require(address(_token) != address(kitty), "kitty");
-        require(address(_token) != address(bbond), "bond");
-        require(address(_token) != address(bshare), "share");
+        require(address(_token) != address(v3s), "v3s");
+        require(address(_token) != address(vbond), "bond");
         _token.safeTransfer(_to, _amount);
+    }
+
+    function tokenTransferOperator(address _token, address _operator) external onlyOperator {
+        IBasisAsset(_token).transferOperator(_operator);
+    }
+
+    function tokenTransferOwnership(address _token, address _operator) external onlyOperator {
+        IBasisAsset(_token).transferOwnership(_operator);
     }
 
     function boardroomSetOperator(address _operator) external onlyOperator {
         IBoardroom(boardroom).setOperator(_operator);
     }
 
-    function boardroomSetLockUp(uint256 _withdrawLockupEpochs, uint256 _rewardLockupEpochs) external onlyOperator {
-        IBoardroom(boardroom).setLockUp(_withdrawLockupEpochs, _rewardLockupEpochs);
+    function boardroomSetLockUp(uint256 _withdrawLockupEpochs) external onlyOperator {
+        IBoardroom(boardroom).setLockUp(_withdrawLockupEpochs);
     }
 
     function boardroomAllocateSeigniorage(uint256 amount) external onlyOperator {
         IBoardroom(boardroom).allocateSeigniorage(amount);
     }
 
-    function boardroomGovernanceRecoverUnsupported(
-        address _token,
-        uint256 _amount,
-        address _to
-    ) external onlyOperator {
-        IBoardroom(boardroom).governanceRecoverUnsupported(_token, _amount, _to);
+    function boardroomGovernanceRecoverUnsupported(address _boardRoomOrToken, address _token, uint256 _amount, address _to) external onlyOperator {
+        IBoardroom(_boardRoomOrToken).governanceRecoverUnsupported(_token, _amount, _to);
     }
 }
